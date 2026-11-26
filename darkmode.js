@@ -3,6 +3,8 @@
   // Set by checkPhotoBackground() on elements that show a photo through a
   // stylesheet background-image, which no CSS selector can find.
   const PHOTO_ATTR = "data-superlevels-photo";
+  // Set by markSkins() on a dark picture background of a light page.
+  const SKIN_ATTR = "data-superlevels-skin";
 
   // A filter applies to the element and everything inside it, so media inside
   // re-inverted media is inverted a third time: every photo in a <picture>
@@ -36,6 +38,8 @@
         background: #fff !important;
       }
       html.superlevels-dark ${OUTER_MEDIA} { ${REINVERT} }
+      /* White here shows as black. See markSkins(). */
+      html.superlevels-dark [${SKIN_ATTR}] { background: #fff !important; }
       /* Fix common elements that break */
       html.superlevels-dark input,
       html.superlevels-dark textarea,
@@ -60,6 +64,7 @@
     } else {
       document.documentElement.classList.remove("superlevels-dark");
       if (style) style.remove();
+      for (const el of document.querySelectorAll(`[${SKIN_ATTR}]`)) el.removeAttribute(SKIN_ATTR);
       watchPhotoBackgrounds(false);
     }
   }
@@ -316,8 +321,20 @@
   // theme with color-mix(), so an rgb()-only parser saw no background there at
   // all and called the page light. A 1×1 canvas turns any CSS colour into sRGB.
   let colorCtx;
+  // A check reads some hundred backgrounds, but a page has few different
+  // colours, and the canvas read is the slow part. Keep the results.
+  const parsedColors = new Map();
   function parseColor(str) {
     if (!str) return null;
+    let c = parsedColors.get(str);
+    if (!c) {
+      if (parsedColors.size > 500) parsedColors.clear();
+      parsedColors.set(str, (c = readColor(str)));
+    }
+    return c;
+  }
+
+  function readColor(str) {
     if (!colorCtx) colorCtx = new OffscreenCanvas(1, 1).getContext("2d", { willReadFrequently: true });
     colorCtx.clearRect(0, 0, 1, 1);
     // The canvas ignores a colour it cannot parse and keeps the last fillStyle,
@@ -335,14 +352,56 @@
     return (0.299 * c.r + 0.587 * c.g + 0.114 * c.b) / 255 >= 0.5;
   }
 
-  // First ancestor (element included) that actually paints a background
+  // First ancestor (element included) that actually paints a background.
+  // Gives the element and its colour, or null.
   function opaqueBgUnder(el) {
     while (el && el !== document.documentElement) {
-      const c = parseColor(getComputedStyle(el).backgroundColor);
-      if (c && c.a >= 0.9) return c;
+      const color = parseColor(getComputedStyle(el).backgroundColor);
+      if (color && color.a >= 0.9) return { el, color };
       el = el.parentElement;
     }
     return null;
+  }
+
+  // ═══════════════════════════════════
+  //  Dark advert skins on a light page
+  // ═══════════════════════════════════
+  // A shop puts a dark advert picture behind its white content column
+  // (alza.cz on Black Friday). Inverted, the skin turns white and glows at
+  // both sides of the dark column. A re-invert is not possible: the skin
+  // element holds the content, and the content would turn light again. So
+  // the skin loses its picture and shows plain black (see buildCSS).
+
+  // The elements that gave a dark colour in the last detectLightPage() run.
+  let darkSources = new Set();
+
+  // True if some visible text has el as its background. Such text is light,
+  // and the inversion makes it dark, so a black background would hide it.
+  // The limit keeps a skin around a whole page cheap: its text sits on the
+  // backgrounds of the content, and the first nodes show that.
+  function hasTextOn(el) {
+    const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let seen = 0;
+    for (let n = walk.nextNode(); n && seen < 300; n = walk.nextNode()) {
+      if (!n.data.trim() || !n.parentElement.checkVisibility()) continue;
+      seen++;
+      const bg = opaqueBgUnder(n.parentElement);
+      if (bg && bg.el === el) return true;
+    }
+    return false;
+  }
+
+  // Call only while the page is inverted.
+  function markSkins() {
+    for (const el of darkSources) {
+      if (!el.isConnected || el.hasAttribute(SKIN_ATTR)) continue;
+      // No picture: a dark menu or footer. It inverts to light, as before.
+      if (!getComputedStyle(el).backgroundImage.includes("url(")) continue;
+      // A photo background is re-inverted and keeps its picture.
+      if (isPhotoBackground(el) || el.closest(WRAPPERS)) continue;
+      if (hasTextOn(el)) continue;
+      el.setAttribute(SKIN_ATTR, "");
+    }
   }
 
   // The page's own <html> background. While the filter is on, our sheet paints
@@ -383,18 +442,39 @@
     // real background on a wrapper div and leave body transparent.
     const w = window.innerWidth;
     const h = window.innerHeight;
-    const votes = [];
+    // A grid of 25 points measures how much of the window is light. Four
+    // points were too few: on alza.cz with a dark advert skin at both sides,
+    // two of them missed the white content column by 10 px, and the tie left
+    // a page white that is 59 % white.
+    const GRID = [0.1, 0.3, 0.5, 0.7, 0.9];
+    let light = 0, dark = 0;
+    darkSources = new Set();
     if (w > 0 && h > 0) {
-      for (const [fx, fy] of [[0.5, 0.3], [0.2, 0.6], [0.8, 0.6], [0.5, 0.85]]) {
-        const c = opaqueBgUnder(document.elementFromPoint(w * fx, h * fy));
-        if (c) votes.push(isLightColor(c));
+      for (const fx of GRID) {
+        for (const fy of GRID) {
+          const bg = opaqueBgUnder(document.elementFromPoint(w * fx, h * fy));
+          if (!bg) continue;
+          if (isLightColor(bg.color)) {
+            light++;
+          } else {
+            dark++;
+            darkSources.add(bg.el);
+          }
+        }
+      }
+      // In a narrow window the skin shows only in the margins, outside the
+      // grid (alza.cz at 1600 px). Look for it at both edges. These points
+      // do not vote. clientWidth leaves out the scrollbar.
+      const cw = document.documentElement.clientWidth;
+      for (const x of [4, cw - 5]) {
+        for (const fy of GRID) {
+          const bg = opaqueBgUnder(document.elementFromPoint(x, h * fy));
+          if (bg && !isLightColor(bg.color)) darkSources.add(bg.el);
+        }
       }
     }
-    if (votes.length) {
-      const light = votes.filter(Boolean).length;
-      // A tie stays dark: inverting a half-dark page turns that half white.
-      return light * 2 > votes.length;
-    }
+    // A tie stays dark: inverting a half-dark page turns that half white.
+    if (light + dark) return light > dark;
 
     // Nothing opaque under the sample points — fall back to the page canvas.
     const bodyBg = document.body && parseColor(getComputedStyle(document.body).backgroundColor);
@@ -447,6 +527,7 @@
     }
     // In the same task as the invert, so no frame shows the page white.
     if (light !== isDarkApplied()) applyDarkMode(light, brightness);
+    if (light) markSkins();
     setVeil(false);
     if (light !== lastVerdict) {
       lastVerdict = light;
